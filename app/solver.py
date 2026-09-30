@@ -1,0 +1,291 @@
+"""双盲评审分配求解器。
+
+硬约束:
+  1. 每篇论文恰好分配给 2 名评审人;
+  2. 同一篇论文的两名评审人必须来自不同机构;
+  3. 两名评审人中至少一人擅长该论文主题
+     (评审人擅长主题与论文主题交集非空; 论文未标注主题时视为所有评审人均满足);
+  4. 评审人不得与论文任一作者机构相同;
+  5. 评审人不得评审自己声明回避的论文;
+  6. 评审人已分配论文数不得超过其容量。
+
+优化目标 (按优先级):
+  1. 最小化全体评审人中最高的"已用容量比例"(已分配数 / 容量);
+  2. 在此前提下, 按 (论文编号升序, 每篇的评审人编号对升序) 展开的全局序列
+     取字典序最小的方案。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+from itertools import combinations
+
+
+@dataclass(frozen=True)
+class Paper:
+    paper_id: str
+    topics: frozenset
+    institutions: frozenset
+
+
+@dataclass(frozen=True)
+class Reviewer:
+    reviewer_id: str
+    topics: frozenset
+    institution: str
+    capacity: int
+    avoid_papers: frozenset
+
+
+def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
+    """评审人是否擅长该论文主题。论文无主题时视为任何评审人均满足。"""
+    if not paper.topics:
+        return True
+    return not reviewer.topics.isdisjoint(paper.topics)
+
+
+def analyze_paper(paper: Paper, reviewers):
+    """返回 (eligible, excluded, pairs)。
+
+    eligible: 通过机构回避与回避名单过滤的评审人 (按编号升序);
+    excluded: 被排除评审人及原因;
+    pairs:    忽略容量时该论文的全部合法评审人对 (元组内与元组间均按编号升序)。
+    """
+    eligible, excluded = [], []
+    for r in reviewers:  # callers 保证 reviewers 已按 reviewer_id 升序
+        if r.institution in paper.institutions:
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "same_institution_as_author"})
+        elif paper.paper_id in r.avoid_papers:
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "on_reviewer_avoid_list"})
+        else:
+            eligible.append(r)
+    pairs = []
+    for a, b in combinations(eligible, 2):
+        if a.institution == b.institution:
+            continue
+        if not (is_expert(a, paper) or is_expert(b, paper)):
+            continue
+        pairs.append((a.reviewer_id, b.reviewer_id))
+    return eligible, excluded, pairs
+
+
+class Solver:
+    def __init__(self, papers, reviewers):
+        self.papers = sorted(papers, key=lambda p: p.paper_id)
+        self.reviewers = sorted(reviewers, key=lambda r: r.reviewer_id)
+        self.info = {}
+        for p in self.papers:
+            eligible, excluded, pairs = analyze_paper(p, self.reviewers)
+            self.info[p.paper_id] = {"eligible": eligible, "excluded": excluded, "pairs": pairs}
+
+    # ---------- 完整方案 ----------
+
+    def find_first(self, caps):
+        """在容量上限 caps 下求字典序最小的完整方案; 不可行返回 None。
+
+        论文按编号升序处理, 每篇的评审人对按字典序枚举, 第一个完整解即全局字典序最小。
+        """
+        order = [p.paper_id for p in self.papers]
+        n = len(order)
+        pairs_of = {pid: self.info[pid]["pairs"] for pid in order}
+        loads = {rid: 0 for rid in caps}
+        assignment = {}
+
+        def rest_ok(i):
+            remaining = sum(caps[rid] - loads[rid] for rid in caps)
+            if remaining < 2 * (n - i):
+                return False
+            for pid in order[i:]:
+                if not any(loads[a] < caps[a] and loads[b] < caps[b] for a, b in pairs_of[pid]):
+                    return False
+            return True
+
+        def backtrack(i):
+            if i == n:
+                return True
+            pid = order[i]
+            for a, b in pairs_of[pid]:
+                if loads[a] < caps[a] and loads[b] < caps[b]:
+                    loads[a] += 1
+                    loads[b] += 1
+                    assignment[pid] = (a, b)
+                    if rest_ok(i + 1) and backtrack(i + 1):
+                        return True
+                    del assignment[pid]
+                    loads[a] -= 1
+                    loads[b] -= 1
+            return False
+
+        if rest_ok(0) and backtrack(0):
+            return assignment
+        return None
+
+    def minimal_ratio_caps(self):
+        """返回使方案可行的、最小化最高已用容量比例所对应的容量上限; 完全不可行返回 None。"""
+        if not self.papers:
+            return {r.reviewer_id: 0 for r in self.reviewers}
+        if not self.reviewers:
+            return None
+        candidates = sorted({
+            Fraction(k, r.capacity)
+            for r in self.reviewers
+            for k in range(1, r.capacity + 1)
+        })
+
+        def caps_for(t: Fraction):
+            return {
+                r.reviewer_id: (t * r.capacity).numerator // (t * r.capacity).denominator
+                for r in self.reviewers
+            }
+
+        if self.find_first(caps_for(candidates[-1])) is None:
+            return None
+        lo, hi = 0, len(candidates) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.find_first(caps_for(candidates[mid])) is not None:
+                hi = mid
+            else:
+                lo = mid + 1
+        return caps_for(candidates[lo])
+
+    # ---------- 不可行时的部分方案与诊断 ----------
+
+    def max_partial(self, caps):
+        """求最多论文被完整分配的部分方案 (并列时按全局序列字典序最小)。
+
+        返回 (assignment, loads)。
+        """
+        order = [p.paper_id for p in self.papers]
+        n = len(order)
+        pairs_of = {pid: self.info[pid]["pairs"] for pid in order}
+        loads = {rid: 0 for rid in caps}
+        assignment = {}
+        best = {"count": -1, "key": None, "assignment": None, "loads": None}
+
+        def key_of(assign):
+            seq = []
+            for pid in order:
+                if pid in assign:
+                    a, b = assign[pid]
+                    seq.append((0, a, b))
+                else:
+                    seq.append((1, "", ""))
+            return tuple(seq)
+
+        def backtrack(i, count):
+            if best["count"] > count + (n - i):
+                return  # 已不可能取得更多分配
+            if i == n:
+                k = key_of(assignment)
+                if count > best["count"] or (count == best["count"] and (best["key"] is None or k < best["key"])):
+                    best["count"] = count
+                    best["key"] = k
+                    best["assignment"] = dict(assignment)
+                    best["loads"] = dict(loads)
+                return
+            pid = order[i]
+            for a, b in pairs_of[pid]:
+                if loads[a] < caps[a] and loads[b] < caps[b]:
+                    loads[a] += 1
+                    loads[b] += 1
+                    assignment[pid] = (a, b)
+                    backtrack(i + 1, count + 1)
+                    del assignment[pid]
+                    loads[a] -= 1
+                    loads[b] -= 1
+            backtrack(i + 1, count)  # 跳过该论文
+
+        backtrack(0, 0)
+        return best["assignment"] or {}, best["loads"] or {rid: 0 for rid in caps}
+
+    def diagnose(self, unassigned_ids, loads, caps):
+        """对每篇未分配论文给出限制原因。"""
+        paper_by_id = {p.paper_id: p for p in self.papers}
+        out = {}
+        for pid in unassigned_ids:
+            paper = paper_by_id[pid]
+            info = self.info[pid]
+            eligible = info["eligible"]
+            pairs = info["pairs"]
+            reasons = []
+            if len(eligible) < 2:
+                reasons.append("fewer_than_two_eligible_reviewers")
+            full = [r.reviewer_id for r in eligible if loads[r.reviewer_id] >= caps[r.reviewer_id]]
+            if eligible and len(eligible) - len(full) < 2:
+                reasons.append("eligible_reviewers_at_capacity")
+            if not any(is_expert(r, paper) for r in eligible):
+                reasons.append("no_expert_among_eligible_reviewers")
+            if len(eligible) >= 2 and len({r.institution for r in eligible}) < 2:
+                reasons.append("eligible_reviewers_share_single_institution")
+            if not pairs:
+                reasons.append("no_valid_reviewer_pair")
+            elif not any(loads[a] < caps[a] and loads[b] < caps[b] for a, b in pairs):
+                reasons.append("all_valid_pairs_blocked_by_capacity")
+            out[pid] = {
+                "eligible_reviewers": [r.reviewer_id for r in eligible],
+                "eligible_at_capacity": full,
+                "excluded": info["excluded"],
+                "reasons": reasons,
+            }
+        return out
+
+
+def _loads_of(plan):
+    loads = {}
+    for a, b in plan.values():
+        loads[a] = loads.get(a, 0) + 1
+        loads[b] = loads.get(b, 0) + 1
+    return loads
+
+
+def compute_assignment(papers, reviewers):
+    """求解入口。返回可 JSON 序列化的结果字典。"""
+    solver = Solver(papers, reviewers)
+    reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
+    explanations = {
+        pid: {
+            "eligible_reviewers": [r.reviewer_id for r in info["eligible"]],
+            "excluded": info["excluded"],
+        }
+        for pid, info in solver.info.items()
+    }
+
+    def paper_entries(plan):
+        return {
+            pid: {"assigned": list(plan[pid]), **explanations[pid]}
+            for pid in sorted(plan)
+        }
+
+    caps = solver.minimal_ratio_caps()
+    if caps is not None:
+        plan = solver.find_first(caps)
+        loads = _loads_of(plan)
+        ratio = Fraction(0)
+        for r in solver.reviewers:
+            ratio = max(ratio, Fraction(loads.get(r.reviewer_id, 0), r.capacity))
+        return {
+            "feasible": True,
+            "plan": {pid: list(pair) for pid, pair in sorted(plan.items())},
+            "unassigned": [],
+            "max_used_capacity_ratio": str(ratio),
+            "max_used_capacity_ratio_value": float(ratio),
+            "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+            "papers": paper_entries(plan),
+            "diagnostics": {},
+        }
+
+    # 无完整方案: 给出最大部分方案与每篇未分配论文的限制原因, 发布版不受影响
+    full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
+    partial, loads = solver.max_partial(full_caps)
+    unassigned = [p.paper_id for p in solver.papers if p.paper_id not in partial]
+    return {
+        "feasible": False,
+        "plan": {pid: list(pair) for pid, pair in sorted(partial.items())},
+        "unassigned": unassigned,
+        "max_used_capacity_ratio": None,
+        "max_used_capacity_ratio_value": None,
+        "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+        "papers": paper_entries(partial),
+        "diagnostics": solver.diagnose(unassigned, loads, full_caps),
+    }
