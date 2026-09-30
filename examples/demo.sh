@@ -77,3 +77,46 @@ curl -s -o /dev/null -w '非法容量        -> HTTP %{http_code}\n' -X POST "$B
 curl -s -o /dev/null -w '重复编号        -> HTTP %{http_code}\n' -X POST "$BASE/papers" \
   -H "$ORG" -H 'Content-Type: application/json' -d '{
     "paper_id": "P1", "manuscript": "x", "topics": [], "institutions": []}'
+
+echo "== 9. 评审人决定: R1 确认 P1 (有效决定推进资料修订号; 重复提交幂等) =="
+curl -s -X POST "$BASE/reviewer/decisions" -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id": "P1", "decision": "confirm"}'; echo
+curl -s -X POST "$BASE/reviewer/decisions" -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id": "P1", "decision": "confirm"}'; echo
+
+echo "== 10. R2 提交回避 (非空原因); 回避后 R2 立即读不到 P1, 其他人不受影响 =="
+curl -s -X POST "$BASE/reviewer/decisions" -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id": "P1", "decision": "decline", "reason": "与作者近期合作"}'; echo
+curl -s "$BASE/reviewer/assignments" -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret'; echo
+
+echo "== 11. 决定错误演示: 已回避再确认 -> 409; 未分配任务 -> 404; 空回避原因 -> 422 =="
+curl -s -o /dev/null -w '已回避再确认    -> HTTP %{http_code}\n' -X POST "$BASE/reviewer/decisions" \
+  -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret' -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "decision": "confirm"}'
+curl -s -o /dev/null -w '未分配任务      -> HTTP %{http_code}\n' -X POST "$BASE/reviewer/decisions" \
+  -H 'X-Reviewer-Id: R3' -H 'X-Reviewer-Credential: r3-secret' -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "decision": "confirm"}'
+curl -s -o /dev/null -w '空回避原因      -> HTTP %{http_code}\n' -X POST "$BASE/reviewer/decisions" \
+  -H 'X-Reviewer-Id: R3' -H 'X-Reviewer-Credential: r3-secret' -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P2", "decision": "decline", "reason": "  "}'
+
+echo "== 12. 会务方核对: 发布方案不变, 决定状态可见 =="
+curl -s "$BASE/assignment" -H "$ORG" | python3 -c 'import sys, json; d = json.load(sys.stdin); print(json.dumps({"plan": d["plan"], "decisions": d["decisions"]}, ensure_ascii=False))'
+
+echo "== 13. 补位预演: 固定已确认关系 (P1<-R1), 回避成为硬回避; 不改变发布版 =="
+RE_DRY=$(curl -s -X POST "$BASE/assignment/reassign/dry-run" -H "$ORG")
+echo "$RE_DRY" | python3 -c 'import sys, json; d = json.load(sys.stdin); print(json.dumps({k: d[k] for k in ("feasible", "plan", "pinned", "revision", "published_version")}, ensure_ascii=False))'
+REV2=$(echo "$RE_DRY" | python3 -c 'import sys, json; print(json.load(sys.stdin)["revision"])')
+PUBV=$(echo "$RE_DRY" | python3 -c 'import sys, json; print(json.load(sys.stdin)["published_version"])')
+
+echo "== 14. 补位发布须复核两种版本: 过期发布版序号 -> 409 =="
+curl -s -o /dev/null -w '过期版本        -> HTTP %{http_code}\n' -X POST "$BASE/assignment/reassign/publish" \
+  -H "$ORG" -H 'Content-Type: application/json' -d "{\"base_revision\": $REV2, \"base_published_version\": 99}"
+
+echo "== 15. 携带预演返回的 (资料修订号, 发布版序号) 补位发布 =="
+curl -s -X POST "$BASE/assignment/reassign/publish" -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV2, \"base_published_version\": $PUBV}"; echo
+
+echo "== 16. 补位发布后仅按新发布版授权取稿 (R2 不再持有 P1, R3 补上) =="
+curl -s "$BASE/reviewer/assignments" -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret'; echo
+curl -s "$BASE/reviewer/assignments" -H 'X-Reviewer-Id: R3' -H 'X-Reviewer-Credential: r3-secret'; echo

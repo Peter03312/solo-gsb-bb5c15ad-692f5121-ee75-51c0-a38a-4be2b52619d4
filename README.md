@@ -24,13 +24,32 @@
 **版本化发布**：每次资料变更（论文/评审人增删改）使资料修订号 +1；预演返回所依据的修订号，
 发布必须携带该修订号，不一致则 `409` 拒绝。校验修订号、重算方案、写入发布版在**同一个
 SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会产生基于旧版资料的方案。
+每次成功发布使**发布版序号**（`published_version`）+1。
+
+**评审人决定**（发布分配后，评审人凭本人凭据对当前发布方案中本人的分配提交）：
+
+1. 可**确认**（`confirm`）或**回避**（`decline`，须提交**非空原因**）；
+2. 同一决定重复提交**幂等**（返回当前状态，不再推进修订号；回避以首次原因为准）；
+3. **已回避任务不能再确认**（`409`）；未在发布方案中的分配拒绝（`404`）；
+4. 有效决定（状态发生变化）使**资料修订号 +1**；
+5. 回避**立即**停止本人读取该匿名稿，并成为**后续分配的硬回避**（排除原因
+   `declined_assignment`）；当前发布方案不变，仍供会务方核对，其他评审人取稿不受影响。
+
+**补位**（会务方基于当前发布版与最新资料重算空位）：
+
+1. 补位预演以**当前发布版及资料修订号**为基准：**已确认且未回避的关系固定**（按评审人
+   席位固定，固定者占用容量），其余位置遵守原有硬约束与优化次序；无完整方案时返回未补齐
+   论文及限制原因，**不改变发布版**；
+2. 补位发布须**同时复核两种版本**（资料修订号 + 发布版序号），任一过期 `409` 拒绝；
+   校验、重算、写入在同一写事务内完成；
+3. 成功后**仅按新发布版授权取稿**，仍在方案中的确认状态予以保留（回避决定持续作为硬回避）。
 
 **权限模型**：
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因 |
-| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 仅可读取**已发布方案中分配给自己**的匿名稿（不含作者机构） |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、补位预演/发布、查询分配与排除原因及决定状态 |
+| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 读取**已发布方案中分配给自己**的匿名稿（不含作者机构，已回避的除外）；对本人分配提交确认/回避决定 |
 
 ## 一键启动（Docker Compose）
 
@@ -80,7 +99,7 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查（无需凭据） |
-| GET | `/meta` | 当前资料修订号与发布状态 |
+| GET | `/meta` | 当前资料修订号与发布状态（含发布版序号） |
 | POST | `/papers` | 录入论文（编号/匿名稿/主题/作者机构），重复编号 `409` |
 | PUT / DELETE | `/papers/{paper_id}` | 更新 / 删除论文，不存在 `404` |
 | GET | `/papers` | 论文列表 |
@@ -89,8 +108,12 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | GET | `/reviewers` | 评审人列表 |
 | POST | `/assignment/dry-run` | 预演：返回方案、未分配论文与限制原因、资料修订号；不影响已发布版 |
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
-| GET | `/assignment` | 查询已发布方案及每篇论文的分配/排除原因 |
-| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`） |
+| GET | `/assignment` | 查询已发布方案、每篇论文的分配/排除原因及评审人决定状态 |
+| POST | `/assignment/reassign/dry-run` | 补位预演：固定已确认关系、回避作为硬回避重算；返回方案、资料修订号与发布版序号；未发布过 `404`，不改变发布版 |
+| POST | `/assignment/reassign/publish` | 补位发布：携带 `{"base_revision": N, "base_published_version": M}`，任一版本过期 `409`，无可行方案 `422` |
+| GET | `/reviewer/assignments` | 评审人读取分配给自己的匿名稿（凭据失效 `401`；已回避的立即不可见） |
+| POST | `/reviewer/decisions` | 评审人对本人当前分配提交决定：`{"paper_id", "decision": "confirm"}` 或 `{"paper_id", "decision": "decline", "reason": "..."}` |
+| GET | `/reviewer/decisions` | 评审人查看本人在当前发布方案内各分配的决定状态 |
 
 ## 调用示例
 
@@ -124,6 +147,42 @@ curl $BASE/assignment -H "$ORG"
 
 # 6. 评审人凭自身凭据读取已分配匿名稿
 curl $BASE/reviewer/assignments -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret'
+```
+
+发布后进入**评审人决定与补位**流程：
+
+```bash
+# 7. 评审人确认本人分配 (重复提交幂等; 有效决定使资料修订号 +1)
+curl -X POST $BASE/reviewer/decisions -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id": "P1", "decision": "confirm"}'
+
+# 8. 评审人回避 (须非空原因; 立即读不到该稿, 并成为后续分配的硬回避)
+curl -X POST $BASE/reviewer/decisions -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "decision": "decline", "reason": "与作者近期合作"}'
+
+# 9. 会务方补位预演: 固定已确认关系, 返回 (revision, published_version) 供发布复核
+curl -X POST $BASE/assignment/reassign/dry-run -H "$ORG"
+
+# 10. 补位发布: 两种版本任一过期即 409; 成功后仅按新发布版授权取稿
+curl -X POST $BASE/assignment/reassign/publish -H "$ORG" -H 'Content-Type: application/json' \
+  -d '{"base_revision": 9, "base_published_version": 1}'
+```
+
+决定接口响应示例：
+
+```json
+{"ok": true, "paper_id": "P1", "reviewer_id": "R1", "decision": "confirmed",
+ "reason": null, "changed": true, "revision": 9}
+```
+
+补位预演响应示例（`pinned` 为被固定的已确认关系）：
+
+```json
+{"feasible": true, "revision": 10, "published_version": 1,
+ "pinned": {"P1": ["R1"]},
+ "plan": {"P1": ["R1", "R3"], "P2": ["R1", "R4"], "P3": ["R2", "R4"], "P4": ["R2", "R3"]},
+ "unassigned": [], "diagnostics": {}}
 ```
 
 预演响应示例（可行）：
@@ -162,12 +221,13 @@ curl $BASE/reviewer/assignments -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 404 | 更新/删除不存在的论文或评审人；尚未发布方案 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更） |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布 |
+| 404 | 更新/删除不存在的论文或评审人；尚未发布方案；对未在发布方案中的分配提交决定；未发布时照旧补位 |
+| 409 | 论文/评审人编号重复；发布或补位发布携带的版本已过期；已回避任务再确认 |
+| 422 | 非法容量（非整数、小于 1）、缺字段、回避原因为空等参数校验失败；无可行方案时强行发布 |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
-（在回避名单）、`fewer_than_two_eligible_reviewers`（合格者不足两人）、
+（在回避名单）、`declined_assignment`（评审人已回避该分配）、
+`fewer_than_two_eligible_reviewers`（合格者不足两人）、
 `eligible_reviewers_at_capacity`（合格者容量占满）、`no_expert_among_eligible_reviewers`
 （合格者无人擅长主题）、`eligible_reviewers_share_single_institution`（合格者同属一个机构）、
 `no_valid_reviewer_pair`（不存在合法评审人对）、`all_valid_pairs_blocked_by_capacity`
@@ -177,12 +237,12 @@ curl $BASE/reviewer/assignments -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布事务
-  solver.py   # 分配求解器（约束检查、最小化最高容量比例、字典序最小、部分方案与诊断）
-  db.py       # SQLite 连接、schema 初始化、修订号、读写事务
+  main.py     # FastAPI 路由、鉴权、发布/补位事务、评审人决定
+  solver.py   # 分配求解器（约束检查、最小化最高容量比例、字典序最小、固定关系补位、部分方案与诊断）
+  db.py       # SQLite 连接、schema 初始化与迁移、修订号、发布版序号、读写事务
   schemas.py  # 请求体模型与校验
-tests/test_api.py   # 24 个接口与求解器测试（含并发发布测试）
-examples/demo.sh    # 端到端 curl 示例
+tests/test_api.py   # 43 个接口与求解器测试（含并发发布、决定幂等、补位版本复核）
+examples/demo.sh    # 端到端 curl 示例（含评审人决定与补位流程）
 Dockerfile / docker-compose.yml
 ```
 

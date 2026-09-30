@@ -13,10 +13,17 @@
   1. 最小化全体评审人中最高的"已用容量比例"(已分配数 / 容量);
   2. 在此前提下, 按 (论文编号升序, 每篇的评审人编号对升序) 展开的全局序列
      取字典序最小的方案。
+
+补位 (pinned):
+  - pinned = {paper_id: (reviewer_id, ...)} 表示该论文中"已确认且未回避"的
+    评审人 (1 或 2 名), 这些关系在新方案中固定, 不再参与优化;
+  - 固定评审人占用容量 (容量下限 = 固定负载), 其余位置仍遵守全部硬约束
+    与上述优化次序;
+  - 评审人回避 (declined) 的论文视为硬回避, 与回避名单同等处理。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import combinations
 
@@ -35,6 +42,7 @@ class Reviewer:
     institution: str
     capacity: int
     avoid_papers: frozenset
+    declined_papers: frozenset = field(default_factory=frozenset)
 
 
 def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
@@ -57,6 +65,8 @@ def analyze_paper(paper: Paper, reviewers):
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "same_institution_as_author"})
         elif paper.paper_id in r.avoid_papers:
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "on_reviewer_avoid_list"})
+        elif paper.paper_id in r.declined_papers:
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": "declined_assignment"})
         else:
             eligible.append(r)
     pairs = []
@@ -70,13 +80,41 @@ def analyze_paper(paper: Paper, reviewers):
 
 
 class Solver:
-    def __init__(self, papers, reviewers):
+    def __init__(self, papers, reviewers, pinned=None):
         self.papers = sorted(papers, key=lambda p: p.paper_id)
         self.reviewers = sorted(reviewers, key=lambda r: r.reviewer_id)
+        reviewer_by_id = {r.reviewer_id: r for r in self.reviewers}
+        # 固定关系: 仅保留当前资料中仍存在的论文与评审人
+        self.pinned = {}
+        for pid, members in (pinned or {}).items():
+            keep = tuple(sorted({m for m in members if m in reviewer_by_id}))
+            if keep:
+                self.pinned[pid] = keep[:2]
         self.info = {}
         for p in self.papers:
             eligible, excluded, pairs = analyze_paper(p, self.reviewers)
+            pin = self.pinned.get(p.paper_id, ())
+            if len(pin) == 2:
+                # 两名评审人均已确认: 评审人对整体固定
+                pairs = [pin]
+            elif len(pin) == 1:
+                # 一名评审人已确认: 固定该席位, 另一名从合格者中按约束选择
+                pr = reviewer_by_id[pin[0]]
+                pin_is_expert = is_expert(pr, p)
+                pairs = sorted(
+                    tuple(sorted((pr.reviewer_id, r.reviewer_id)))
+                    for r in eligible
+                    if r.reviewer_id != pr.reviewer_id
+                    and r.institution != pr.institution
+                    and (pin_is_expert or is_expert(r, p))
+                )
             self.info[p.paper_id] = {"eligible": eligible, "excluded": excluded, "pairs": pairs}
+        # 固定评审人的必然负载 (每篇被固定的论文都必然占用其一个席位)
+        self.pinned_loads = {r.reviewer_id: 0 for r in self.reviewers}
+        for pid, members in self.pinned.items():
+            if pid in self.info:
+                for rid in members:
+                    self.pinned_loads[rid] += 1
 
     # ---------- 完整方案 ----------
 
@@ -121,7 +159,10 @@ class Solver:
         return None
 
     def minimal_ratio_caps(self):
-        """返回使方案可行的、最小化最高已用容量比例所对应的容量上限; 完全不可行返回 None。"""
+        """返回使方案可行的、最小化最高已用容量比例所对应的容量上限; 完全不可行返回 None。
+
+        容量下限为固定负载 (已确认关系必须保留), 因此候选比例需覆盖固定负载。
+        """
         if not self.papers:
             return {r.reviewer_id: 0 for r in self.reviewers}
         if not self.reviewers:
@@ -129,12 +170,15 @@ class Solver:
         candidates = sorted({
             Fraction(k, r.capacity)
             for r in self.reviewers
-            for k in range(1, r.capacity + 1)
+            for k in range(1, max(r.capacity, self.pinned_loads[r.reviewer_id]) + 1)
         })
 
         def caps_for(t: Fraction):
             return {
-                r.reviewer_id: (t * r.capacity).numerator // (t * r.capacity).denominator
+                r.reviewer_id: max(
+                    (t * r.capacity).numerator // (t * r.capacity).denominator,
+                    self.pinned_loads[r.reviewer_id],
+                )
                 for r in self.reviewers
             }
 
@@ -239,9 +283,11 @@ def _loads_of(plan):
     return loads
 
 
-def compute_assignment(papers, reviewers):
-    """求解入口。返回可 JSON 序列化的结果字典。"""
-    solver = Solver(papers, reviewers)
+def compute_assignment(papers, reviewers, pinned=None):
+    """求解入口。pinned 为 {paper_id: (reviewer_id, ...)} 的固定关系 (补位时使用)。
+
+    返回可 JSON 序列化的结果字典。"""
+    solver = Solver(papers, reviewers, pinned=pinned)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     explanations = {
         pid: {
@@ -276,7 +322,11 @@ def compute_assignment(papers, reviewers):
         }
 
     # 无完整方案: 给出最大部分方案与每篇未分配论文的限制原因, 发布版不受影响
-    full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
+    # 容量下限同样取固定负载, 保证已确认关系在部分方案中优先保留
+    full_caps = {
+        r.reviewer_id: max(r.capacity, solver.pinned_loads[r.reviewer_id])
+        for r in solver.reviewers
+    }
     partial, loads = solver.max_partial(full_caps)
     unassigned = [p.paper_id for p in solver.papers if p.paper_id not in partial]
     return {
